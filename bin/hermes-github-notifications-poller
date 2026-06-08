@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Poll GitHub notifications and hand actionable items to Hermes.
+
+Designed for script-only Hermes cron: no stdout means no user-visible message.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import textwrap
+from typing import Any, Iterable
+
+DEFAULT_REASONS = {"assign", "mention", "review_requested", "team_mention", "comment"}
+DEFAULT_STATE_DIR = Path.home() / ".hermes" / "github-notifications"
+DEFAULT_SKILLS = "github-issues,github-pr-workflow,github-code-review,github-bot-pr-workflow"
+BOT_LOGIN_DEFAULT = "ottobachhuberbot"
+REVIEWER_DEFAULT = "danielbachhuber"
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs(state_dir: Path) -> dict[str, Path]:
+    dirs = {
+        "root": state_dir,
+        "pending": state_dir / "pending",
+        "claimed": state_dir / "claimed",
+        "done": state_dir / "done",
+        "failed": state_dir / "failed",
+        "logs": state_dir / "logs",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def log_line(state_dir: Path, message: str) -> None:
+    ensure_dirs(state_dir)
+    with (state_dir / "poller.log").open("a", encoding="utf-8") as f:
+        f.write(f"{utc_now()} {message}\n")
+
+
+def run_json(cmd: list[str], timeout: int = 60) -> Any:
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\nSTDERR:\n{proc.stderr}")
+    if not proc.stdout.strip():
+        return None
+    return json.loads(proc.stdout)
+
+
+def fetch_notifications(gh: str) -> list[dict[str, Any]]:
+    # gh --paginate emits one JSON array per page for this endpoint in practice.
+    proc = subprocess.run([gh, "api", "notifications", "--paginate"], text=True, capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"failed to fetch notifications ({proc.returncode}): {proc.stderr}")
+    text = proc.stdout.strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed]
+    except json.JSONDecodeError:
+        notifications: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if isinstance(item, list):
+                notifications.extend(item)
+            else:
+                notifications.append(item)
+        return notifications
+
+
+def is_actionable(notification: dict[str, Any], reasons: set[str]) -> bool:
+    return notification.get("reason") in reasons
+
+
+def safe_thread_id(notification: dict[str, Any]) -> str:
+    raw = str(notification.get("id") or "unknown")
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in raw)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def build_spool(notification: dict[str, Any], *, bot_login: str, reviewer: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "received_at": utc_now(),
+        "bot_login": bot_login,
+        "reviewer": reviewer,
+        "notification": notification,
+        "thread_id": notification.get("id"),
+        "reason": notification.get("reason"),
+        "repository": (notification.get("repository") or {}).get("full_name"),
+        "subject": notification.get("subject"),
+        "notification_url": notification.get("url"),
+        "subscription_url": notification.get("subscription_url"),
+    }
+
+
+def mark_done(gh: str, thread_id: str, *, dry_run: bool) -> None:
+    if dry_run:
+        return
+    proc = subprocess.run([gh, "api", "--method", "DELETE", f"/notifications/threads/{thread_id}"], text=True, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"failed to mark notification {thread_id} done ({proc.returncode}): {proc.stderr}")
+
+
+def build_agent_prompt(spool_path: Path, bot_login: str, reviewer: str) -> str:
+    return textwrap.dedent(f"""
+    You are a GitHub bot agent handling one spooled GitHub notification.
+
+    Spool file: {spool_path}
+    Bot account: {bot_login}
+    Default PR reviewer: {reviewer}
+
+    Instructions:
+    1. Read the spool file. It contains the original GitHub notification, already marked done/read in GitHub.
+    2. Use `gh` to fetch current context from the notification subject URL and repository. Do not rely on the notification still being unread.
+    3. Decide whether this notification is actionable for `{bot_login}`. It is actionable if the bot was assigned, mentioned, requested for review, or is already participating/assigned and the new comment needs a response.
+    4. If irrelevant, write a short explanation to the log/status and stop.
+    5. If actionable, acknowledge or respond on GitHub as appropriate.
+    6. If code changes are needed, clone/use the repo, create a branch, commit, push, and create a pull request by default. Request review from `{reviewer}` when the PR is ready.
+    7. Avoid destructive actions unless explicitly requested by the GitHub issue/PR/comment and safe to do.
+    8. When finished, write a concise status summary to the same state directory as the spool file.
+    """).strip()
+
+
+def spawn_agent(*, hermes: str, spool_path: Path, dirs: dict[str, Path], bot_login: str, reviewer: str, dry_run: bool, extra_args: list[str]) -> subprocess.Popen[str] | None:
+    if dry_run:
+        return None
+    prompt = build_agent_prompt(spool_path, bot_login, reviewer)
+    log_path = dirs["logs"] / f"{spool_path.stem}.log"
+    cmd = [hermes, "chat", "-q", prompt, "--source", "github-notification-poller"]
+    if DEFAULT_SKILLS:
+        cmd.extend(["--skills", DEFAULT_SKILLS])
+    cmd.extend(extra_args)
+    log_fh = log_path.open("a", encoding="utf-8")
+    log_fh.write(f"=== {utc_now()} spawning: {' '.join(cmd[:2])} ... ===\n")
+    log_fh.flush()
+    # Start a fully separate process/session; cron script exits immediately.
+    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    return proc
+
+
+def process_notification(notification: dict[str, Any], *, args: argparse.Namespace, dirs: dict[str, Path]) -> tuple[str, str]:
+    thread_id = safe_thread_id(notification)
+    spool = build_spool(notification, bot_login=args.bot_login, reviewer=args.reviewer)
+    pending = dirs["pending"] / f"{thread_id}.json"
+    claimed = dirs["claimed"] / f"{thread_id}.json"
+    failed = dirs["failed"] / f"{thread_id}.json"
+
+    atomic_write_json(pending, spool)
+    mark_done(args.gh, thread_id, dry_run=args.dry_run)
+    if claimed.exists():
+        claimed.unlink()
+    os.replace(pending, claimed)
+    try:
+        spawn_agent(
+            hermes=args.hermes,
+            spool_path=claimed,
+            dirs=dirs,
+            bot_login=args.bot_login,
+            reviewer=args.reviewer,
+            dry_run=args.dry_run,
+            extra_args=args.hermes_arg or [],
+        )
+    except Exception:
+        if failed.exists():
+            failed.unlink()
+        os.replace(claimed, failed)
+        raise
+    return thread_id, str(claimed)
+
+
+def parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    parser.add_argument("--gh", default=shutil.which("gh") or "gh")
+    parser.add_argument("--hermes", default=shutil.which("hermes") or "hermes")
+    parser.add_argument("--bot-login", default=os.environ.get("GITHUB_BOT_LOGIN", BOT_LOGIN_DEFAULT))
+    parser.add_argument("--reviewer", default=os.environ.get("GITHUB_DEFAULT_REVIEWER", REVIEWER_DEFAULT))
+    parser.add_argument("--reason", action="append", dest="reasons", help="Notification reason to process. Repeatable. Defaults to actionable reasons.")
+    parser.add_argument("--dry-run", action="store_true", help="Do not mark notifications done or spawn Hermes. Writes spool files in claimed/ for inspection.")
+    parser.add_argument("--verbose", action="store_true", help="Print a short summary to stdout. Avoid for script-only cron.")
+    parser.add_argument("--hermes-arg", action="append", default=[], help="Extra argument to pass to spawned hermes chat. Repeatable.")
+    return parser.parse_args(list(argv))
+
+
+def main(argv: Iterable[str] = sys.argv[1:]) -> int:
+    args = parse_args(argv)
+    dirs = ensure_dirs(args.state_dir)
+    reasons = set(args.reasons or DEFAULT_REASONS)
+    try:
+        notifications = fetch_notifications(args.gh)
+        actionable = [n for n in notifications if is_actionable(n, reasons)]
+        processed: list[tuple[str, str]] = []
+        for notification in actionable:
+            processed.append(process_notification(notification, args=args, dirs=dirs))
+        if processed:
+            log_line(args.state_dir, f"processed {len(processed)} notification(s): {', '.join(t for t, _ in processed)}")
+        if args.verbose:
+            print(json.dumps({"fetched": len(notifications), "actionable": len(actionable), "processed": processed}, indent=2))
+        return 0
+    except Exception as e:
+        log_line(args.state_dir, f"ERROR {type(e).__name__}: {e}")
+        # Print errors so script-only cron can alert on real failures.
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
