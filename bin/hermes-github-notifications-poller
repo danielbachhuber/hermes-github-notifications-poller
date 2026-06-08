@@ -147,9 +147,11 @@ def spawn_agent(*, hermes: str, spool_path: Path, dirs: dict[str, Path], bot_log
         return None
     prompt = build_agent_prompt(spool_path, bot_login, reviewer)
     log_path = dirs["logs"] / f"{spool_path.stem}.log"
-    cmd = [hermes, "chat", "-q", prompt, "--source", "github-notification-poller"]
+    cmd = [hermes]
     if DEFAULT_SKILLS:
+        # --skills is a global Hermes flag, so it must appear before `chat`.
         cmd.extend(["--skills", DEFAULT_SKILLS])
+    cmd.extend(["chat", "-q", prompt, "--source", "github-notification-poller"])
     cmd.extend(extra_args)
     log_fh = log_path.open("a", encoding="utf-8")
     log_fh.write(f"=== {utc_now()} spawning: {' '.join(cmd[:2])} ... ===\n")
