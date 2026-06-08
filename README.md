@@ -19,6 +19,23 @@ The business logic lives in `bin/hermes-github-notifications-poller`.
 - `hermes` available on PATH if spawning agents.
 - Python 3.9+.
 
+## Configuration
+
+The poller is intentionally generic. Configure installation-specific behavior with environment variables or CLI flags:
+
+| Environment variable | CLI flag | Purpose |
+| --- | --- | --- |
+| `GITHUB_BOT_LOGIN` | `--bot-login` | GitHub login for the bot account. If omitted, the spawned agent infers the bot from the authenticated `gh` account. |
+| `GITHUB_DEFAULT_REVIEWER` | `--reviewer` | Optional default reviewer to request when the agent opens a ready PR. If omitted, no default reviewer is requested. |
+
+Example:
+
+```bash
+GITHUB_BOT_LOGIN=my-github-bot \
+GITHUB_DEFAULT_REVIEWER=octocat \
+bin/hermes-github-notifications-poller
+```
+
 ## Quick start
 
 Dry-run without marking notifications read or spawning Hermes:
@@ -84,8 +101,10 @@ The spawned Hermes prompt instructs the agent to:
 - fetch current GitHub context with `gh`;
 - ignore irrelevant notifications;
 - acknowledge actionable requests;
+- address review comments incrementally on bot-authored pull requests;
+- avoid modifying code when only asked to review;
 - create pull requests by default for code changes;
-- request review from `danielbachhuber` when PRs are ready.
+- request the configured default reviewer, if one is configured.
 
 ## Useful commands
 

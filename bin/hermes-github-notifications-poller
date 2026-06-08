@@ -19,8 +19,6 @@ from typing import Any, Iterable
 DEFAULT_REASONS = {"assign", "mention", "review_requested", "team_mention", "comment"}
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "github-notifications"
 DEFAULT_SKILLS = "github-issues,github-pr-workflow,github-code-review,github-bot-pr-workflow"
-BOT_LOGIN_DEFAULT = "ottobachhuberbot"
-REVIEWER_DEFAULT = "danielbachhuber"
 
 
 def utc_now() -> str:
@@ -98,12 +96,11 @@ def atomic_write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def build_spool(notification: dict[str, Any], *, bot_login: str, reviewer: str) -> dict[str, Any]:
-    return {
+def build_spool(notification: dict[str, Any], *, bot_login: str | None, reviewer: str | None) -> dict[str, Any]:
+    spool = {
         "schema_version": 1,
         "received_at": utc_now(),
         "bot_login": bot_login,
-        "reviewer": reviewer,
         "notification": notification,
         "thread_id": notification.get("id"),
         "reason": notification.get("reason"),
@@ -112,6 +109,9 @@ def build_spool(notification: dict[str, Any], *, bot_login: str, reviewer: str) 
         "notification_url": notification.get("url"),
         "subscription_url": notification.get("subscription_url"),
     }
+    if reviewer:
+        spool["reviewer"] = reviewer
+    return spool
 
 
 def mark_done(gh: str, thread_id: str, *, dry_run: bool) -> None:
@@ -122,27 +122,45 @@ def mark_done(gh: str, thread_id: str, *, dry_run: bool) -> None:
         raise RuntimeError(f"failed to mark notification {thread_id} done ({proc.returncode}): {proc.stderr}")
 
 
-def build_agent_prompt(spool_path: Path, bot_login: str, reviewer: str) -> str:
+def build_agent_prompt(spool_path: Path, bot_login: str | None, reviewer: str | None) -> str:
+    bot_line = f"Bot account: {bot_login}" if bot_login else "Bot account: infer from `gh api user` / authenticated gh account"
+    reviewer_line = f"Default PR reviewer: {reviewer}" if reviewer else "Default PR reviewer: none configured; do not request a reviewer unless the repository/user instructions specify one"
+    reviewer_instruction = (
+        f"Request review from `{reviewer}` when the PR is ready."
+        if reviewer
+        else "Do not request a default reviewer; only request reviewers explicitly required by repo or user instructions."
+    )
+    bot_reference = f"`{bot_login}`" if bot_login else "the authenticated bot account"
     return textwrap.dedent(f"""
     You are a GitHub bot agent handling one spooled GitHub notification.
 
     Spool file: {spool_path}
-    Bot account: {bot_login}
-    Default PR reviewer: {reviewer}
+    {bot_line}
+    {reviewer_line}
 
-    Instructions:
+    First steps:
     1. Read the spool file. It contains the original GitHub notification, already marked done/read in GitHub.
     2. Use `gh` to fetch current context from the notification subject URL and repository. Do not rely on the notification still being unread.
-    3. Decide whether this notification is actionable for `{bot_login}`. It is actionable if the bot was assigned, mentioned, requested for review, or is already participating/assigned and the new comment needs a response.
-    4. If irrelevant, write a short explanation to the log/status and stop.
-    5. If actionable, acknowledge or respond on GitHub as appropriate.
-    6. If code changes are needed, clone/use the repo, create a branch, commit, push, and create a pull request by default. Request review from `{reviewer}` when the PR is ready.
-    7. Avoid destructive actions unless explicitly requested by the GitHub issue/PR/comment and safe to do.
-    8. When finished, write a concise status summary to the same state directory as the spool file.
+    3. Infer the authenticated bot account with `gh api user --jq .login` if the spool file does not include `bot_login`.
+
+    Decision matrix:
+    - Assigned issue: if the notification is for an issue assigned to {bot_reference}, read the issue, acknowledge if useful, do the requested work, and open a pull request when code changes are needed.
+    - Assigned pull request: if the notification is for a pull request assigned to {bot_reference}, inspect the PR and help only within the role requested by the assignment/comments.
+    - Review requested: if {bot_reference} was requested as a reviewer, review the pull request and leave review feedback. Do not modify code unless explicitly asked.
+    - Review submitted or review comments on a bot-authored pull request: if the pull request author is {bot_reference}, address review comments incrementally with focused commits pushed to the same PR branch. Do not open a second PR.
+    - Comment on an assigned or mentioned issue/PR: if {bot_reference} is assigned, mentioned, requested for review, or is the PR author, read the latest comment and surrounding context, then respond or act as appropriate.
+    - Unrelated notification: if {bot_reference} is not assigned, mentioned, requested for review, participating in the requested role, or the PR author, do nothing on GitHub. Write a local status explaining that it was ignored.
+
+    General instructions:
+    1. If irrelevant, write a short explanation to the log/status and stop without commenting.
+    2. If actionable, acknowledge or respond on GitHub as appropriate.
+    3. If code changes are needed, clone/use the repo, create a branch, commit, push, and create a pull request by default. {reviewer_instruction}
+    4. Avoid destructive actions unless explicitly requested by the GitHub issue/PR/comment and safe to do.
+    5. When finished, write a concise status summary to the same state directory as the spool file.
     """).strip()
 
 
-def spawn_agent(*, hermes: str, spool_path: Path, dirs: dict[str, Path], bot_login: str, reviewer: str, dry_run: bool, extra_args: list[str]) -> subprocess.Popen[str] | None:
+def spawn_agent(*, hermes: str, spool_path: Path, dirs: dict[str, Path], bot_login: str | None, reviewer: str | None, dry_run: bool, extra_args: list[str]) -> subprocess.Popen[str] | None:
     if dry_run:
         return None
     prompt = build_agent_prompt(spool_path, bot_login, reviewer)
@@ -196,8 +214,8 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--gh", default=shutil.which("gh") or "gh")
     parser.add_argument("--hermes", default=shutil.which("hermes") or "hermes")
-    parser.add_argument("--bot-login", default=os.environ.get("GITHUB_BOT_LOGIN", BOT_LOGIN_DEFAULT))
-    parser.add_argument("--reviewer", default=os.environ.get("GITHUB_DEFAULT_REVIEWER", REVIEWER_DEFAULT))
+    parser.add_argument("--bot-login", default=os.environ.get("GITHUB_BOT_LOGIN"), help="Bot GitHub login. Defaults to the authenticated gh account when omitted.")
+    parser.add_argument("--reviewer", default=os.environ.get("GITHUB_DEFAULT_REVIEWER"), help="Default reviewer to request on ready PRs. Omit to avoid requesting a default reviewer.")
     parser.add_argument("--reason", action="append", dest="reasons", help="Notification reason to process. Repeatable. Defaults to actionable reasons.")
     parser.add_argument("--dry-run", action="store_true", help="Do not mark notifications done or spawn Hermes. Writes spool files in claimed/ for inspection.")
     parser.add_argument("--verbose", action="store_true", help="Print a short summary to stdout. Avoid for script-only cron.")
