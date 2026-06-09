@@ -84,10 +84,19 @@ class PollerTests(unittest.TestCase):
         self.assertIn("assigned to `my-bot`", prompt)
 
     def test_parse_args_uses_environment_configuration(self):
-        with patch.dict("os.environ", {"GITHUB_BOT_LOGIN": "env-bot", "GITHUB_DEFAULT_REVIEWER": "env-reviewer"}, clear=False):
+        with patch.dict(
+            "os.environ",
+            {
+                "GITHUB_BOT_LOGIN": "env-bot",
+                "GITHUB_DEFAULT_REVIEWER": "env-reviewer",
+                "GITHUB_TRUSTED_USERS": "alice,bob",
+            },
+            clear=False,
+        ):
             args = poller.parse_args([])
         self.assertEqual(args.bot_login, "env-bot")
         self.assertEqual(args.reviewer, "env-reviewer")
+        self.assertEqual(args.trusted_users, "alice,bob")
 
     def test_parse_args_has_no_installation_specific_defaults(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -96,10 +105,40 @@ class PollerTests(unittest.TestCase):
         self.assertIsNone(args.reviewer)
 
     def test_parse_args_cli_overrides_environment_configuration(self):
-        with patch.dict("os.environ", {"GITHUB_BOT_LOGIN": "env-bot", "GITHUB_DEFAULT_REVIEWER": "env-reviewer"}, clear=False):
-            args = poller.parse_args(["--bot-login", "cli-bot", "--reviewer", "cli-reviewer"])
+        with patch.dict(
+            "os.environ",
+            {
+                "GITHUB_BOT_LOGIN": "env-bot",
+                "GITHUB_DEFAULT_REVIEWER": "env-reviewer",
+                "GITHUB_TRUSTED_USERS": "env-user",
+            },
+            clear=False,
+        ):
+            args = poller.parse_args(["--bot-login", "cli-bot", "--reviewer", "cli-reviewer", "--trusted-users", "cli-user"])
         self.assertEqual(args.bot_login, "cli-bot")
         self.assertEqual(args.reviewer, "cli-reviewer")
+        self.assertEqual(args.trusted_users, "cli-user")
+
+    def test_parse_trusted_users_splits_commas_and_whitespace(self):
+        self.assertEqual(poller.parse_trusted_users(" alice, bob\ncarol "), {"alice", "bob", "carol"})
+
+    def test_notification_from_trusted_user_accepts_latest_comment_author(self):
+        notification = self.notification()
+        notification["subject"]["latest_comment_url"] = "https://api.github.com/repos/owner/repo/issues/comments/99"
+        with patch.object(poller, "run_json", return_value={"user": {"login": "danielbachhuber"}}) as run_json:
+            self.assertTrue(poller.notification_from_trusted_user(notification, {"danielbachhuber"}, gh="gh"))
+        run_json.assert_called_once_with(["gh", "api", "https://api.github.com/repos/owner/repo/issues/comments/99"])
+
+    def test_notification_from_trusted_user_rejects_untrusted_latest_comment_author(self):
+        notification = self.notification()
+        notification["subject"]["latest_comment_url"] = "https://api.github.com/repos/owner/repo/issues/comments/99"
+        with patch.object(poller, "run_json", return_value={"user": {"login": "mallory"}}):
+            self.assertFalse(poller.notification_from_trusted_user(notification, {"danielbachhuber"}, gh="gh"))
+
+    def test_notification_from_trusted_user_rejects_when_no_trusted_users_configured(self):
+        with patch.object(poller, "run_json") as run_json:
+            self.assertFalse(poller.notification_from_trusted_user(self.notification(), set(), gh="gh"))
+        run_json.assert_not_called()
 
     def test_fetch_notifications_parses_single_json_array(self):
         payload = [self.notification(id="1"), self.notification(id="2")]
@@ -227,18 +266,19 @@ class PollerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             stdout.write.assert_not_called()
 
-    def test_main_filters_notifications_and_processes_only_actionable(self):
-        notifications = [self.notification(id="1", reason="assign"), self.notification(id="2", reason="ci_activity")]
-        with tempfile.TemporaryDirectory() as td, patch.object(poller, "fetch_notifications", return_value=notifications), patch.object(poller, "process_notification", return_value=("1", "claimed/1.json")) as process:
-            code = poller.main(["--state-dir", td])
+    def test_main_filters_notifications_and_processes_only_actionable_from_trusted_users(self):
+        notifications = [self.notification(id="1", reason="assign"), self.notification(id="2", reason="assign")]
+        with tempfile.TemporaryDirectory() as td, patch.object(poller, "fetch_notifications", return_value=notifications), patch.object(poller, "notification_from_trusted_user", side_effect=[True, False]) as trusted, patch.object(poller, "process_notification", return_value=("1", "claimed/1.json")) as process:
+            code = poller.main(["--state-dir", td, "--trusted-users", "danielbachhuber"])
         self.assertEqual(code, 0)
+        self.assertEqual(trusted.call_count, 2)
         process.assert_called_once()
         self.assertEqual(process.call_args.args[0]["id"], "1")
 
     def test_main_custom_reason_filter(self):
         notifications = [self.notification(id="1", reason="ci_activity"), self.notification(id="2", reason="assign")]
-        with tempfile.TemporaryDirectory() as td, patch.object(poller, "fetch_notifications", return_value=notifications), patch.object(poller, "process_notification", return_value=("1", "claimed/1.json")) as process:
-            code = poller.main(["--state-dir", td, "--reason", "ci_activity"])
+        with tempfile.TemporaryDirectory() as td, patch.object(poller, "fetch_notifications", return_value=notifications), patch.object(poller, "notification_from_trusted_user", return_value=True), patch.object(poller, "process_notification", return_value=("1", "claimed/1.json")) as process:
+            code = poller.main(["--state-dir", td, "--reason", "ci_activity", "--trusted-users", "danielbachhuber"])
         self.assertEqual(code, 0)
         process.assert_called_once()
         self.assertEqual(process.call_args.args[0]["id"], "1")

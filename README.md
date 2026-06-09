@@ -27,12 +27,14 @@ The poller is intentionally generic. Configure installation-specific behavior wi
 | --- | --- | --- |
 | `GITHUB_BOT_LOGIN` | `--bot-login` | GitHub login for the bot account. If omitted, the spawned agent infers the bot from the authenticated `gh` account. |
 | `GITHUB_DEFAULT_REVIEWER` | `--reviewer` | Optional default reviewer to request when the agent opens a ready PR. If omitted, no default reviewer is requested. |
+| `GITHUB_TRUSTED_USERS` | `--trusted-users` | Required comma- or whitespace-separated GitHub logins allowed to trigger Hermes agent processing. If omitted, no notifications are processed. |
 
 Example:
 
 ```bash
 GITHUB_BOT_LOGIN=my-github-bot \
 GITHUB_DEFAULT_REVIEWER=octocat \
+GITHUB_TRUSTED_USERS=octocat \
 bin/hermes-github-notifications-poller
 ```
 
@@ -81,7 +83,9 @@ Script-only behavior matters: empty stdout means no message and no LLM call.
 
 ## Default filters
 
-The poller processes notifications whose `reason` is one of:
+The poller only processes notifications from trusted GitHub users configured with `GITHUB_TRUSTED_USERS` / `--trusted-users`. It fetches the notification's `latest_comment_url` when present, otherwise the subject URL, and requires that API payload's `user.login` to appear in the trusted set before spawning Hermes. This prevents untrusted GitHub users from triggering an agent run that could exfiltrate local context or secrets.
+
+After the trusted-user check passes, the poller processes notifications whose `reason` is one of:
 
 - `assign`
 - `mention`
