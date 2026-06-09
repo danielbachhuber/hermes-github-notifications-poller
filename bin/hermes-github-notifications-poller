@@ -85,6 +85,29 @@ def is_actionable(notification: dict[str, Any], reasons: set[str]) -> bool:
     return notification.get("reason") in reasons
 
 
+def parse_trusted_users(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    normalized = value.replace(",", " ")
+    return {part.strip() for part in normalized.split() if part.strip()}
+
+
+def notification_actor_url(notification: dict[str, Any]) -> str | None:
+    subject = notification.get("subject") or {}
+    return subject.get("latest_comment_url") or subject.get("url")
+
+
+def notification_from_trusted_user(notification: dict[str, Any], trusted_users: set[str], *, gh: str) -> bool:
+    if not trusted_users:
+        return False
+    actor_url = notification_actor_url(notification)
+    if not actor_url:
+        return False
+    payload = run_json([gh, "api", actor_url])
+    login = ((payload or {}).get("user") or {}).get("login")
+    return login in trusted_users
+
+
 def safe_thread_id(notification: dict[str, Any]) -> str:
     raw = str(notification.get("id") or "unknown")
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in raw)
@@ -216,6 +239,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--hermes", default=shutil.which("hermes") or "hermes")
     parser.add_argument("--bot-login", default=os.environ.get("GITHUB_BOT_LOGIN"), help="Bot GitHub login. Defaults to the authenticated gh account when omitted.")
     parser.add_argument("--reviewer", default=os.environ.get("GITHUB_DEFAULT_REVIEWER"), help="Default reviewer to request on ready PRs. Omit to avoid requesting a default reviewer.")
+    parser.add_argument("--trusted-users", default=os.environ.get("GITHUB_TRUSTED_USERS"), help="Comma- or whitespace-separated GitHub logins allowed to trigger agent processing. Defaults to GITHUB_TRUSTED_USERS; if omitted, no notifications are processed.")
     parser.add_argument("--reason", action="append", dest="reasons", help="Notification reason to process. Repeatable. Defaults to actionable reasons.")
     parser.add_argument("--dry-run", action="store_true", help="Do not mark notifications done or spawn Hermes. Writes spool files in claimed/ for inspection.")
     parser.add_argument("--verbose", action="store_true", help="Print a short summary to stdout. Avoid for script-only cron.")
@@ -227,9 +251,14 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
     args = parse_args(argv)
     dirs = ensure_dirs(args.state_dir)
     reasons = set(args.reasons or DEFAULT_REASONS)
+    trusted_users = parse_trusted_users(args.trusted_users)
     try:
         notifications = fetch_notifications(args.gh)
-        actionable = [n for n in notifications if is_actionable(n, reasons)]
+        actionable = [
+            n
+            for n in notifications
+            if is_actionable(n, reasons) and notification_from_trusted_user(n, trusted_users, gh=args.gh)
+        ]
         processed: list[tuple[str, str]] = []
         for notification in actionable:
             processed.append(process_notification(notification, args=args, dirs=dirs))
