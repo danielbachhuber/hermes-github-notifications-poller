@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 DEFAULT_REASONS = {"assign", "mention", "review_requested", "team_mention", "comment"}
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "github-notifications"
-DEFAULT_SKILLS = "github-issues,github-pr-workflow,github-code-review,github-bot-pr-workflow"
+DEFAULT_SKILLS = "github-workflows"
 
 
 def utc_now() -> str:
