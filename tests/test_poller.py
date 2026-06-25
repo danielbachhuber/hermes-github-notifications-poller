@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "hermes-github-notifications-poller"
 loader = SourceFileLoader("poller", str(SCRIPT))
@@ -32,7 +32,7 @@ class PollerTests(unittest.TestCase):
         }
 
     def test_is_actionable_default_reasons(self):
-        for reason in ["assign", "mention", "review_requested", "team_mention", "comment"]:
+        for reason in ["assign", "mention", "review_requested", "team_mention", "comment", "author"]:
             with self.subTest(reason=reason):
                 self.assertTrue(poller.is_actionable({"reason": reason}, poller.DEFAULT_REASONS))
         for reason in ["ci_activity", "state_change", "subscribed", "security_alert", None]:
@@ -139,6 +139,36 @@ class PollerTests(unittest.TestCase):
         with patch.object(poller, "run_json") as run_json:
             self.assertFalse(poller.notification_from_trusted_user(self.notification(), set(), gh="gh"))
         run_json.assert_not_called()
+
+    def test_notification_from_trusted_user_accepts_author_pr_when_latest_review_is_trusted(self):
+        notification = self.notification(reason="author", subject_type="PullRequest")
+        notification["subject"]["url"] = "https://api.github.com/repos/owner/repo/pulls/7"
+        responses = [
+            {"user": {"login": "bot"}},
+            [{"user": {"login": "mallory"}, "created_at": "2026-01-01T00:00:00Z"}],
+            [{"user": {"login": "danielbachhuber"}, "submitted_at": "2026-01-02T00:00:00Z"}],
+        ]
+        with patch.object(poller, "run_json", side_effect=responses) as run_json:
+            self.assertTrue(poller.notification_from_trusted_user(notification, {"danielbachhuber"}, gh="gh"))
+        self.assertEqual(
+            [call.args[0] for call in run_json.call_args_list],
+            [
+                ["gh", "api", "https://api.github.com/repos/owner/repo/pulls/7"],
+                ["gh", "api", "https://api.github.com/repos/owner/repo/issues/7/comments"],
+                ["gh", "api", "https://api.github.com/repos/owner/repo/pulls/7/reviews"],
+            ],
+        )
+
+    def test_notification_from_trusted_user_rejects_author_pr_when_latest_discussion_is_untrusted(self):
+        notification = self.notification(reason="author", subject_type="PullRequest")
+        notification["subject"]["url"] = "https://api.github.com/repos/owner/repo/pulls/7"
+        responses = [
+            {"user": {"login": "bot"}},
+            [{"user": {"login": "danielbachhuber"}, "created_at": "2026-01-01T00:00:00Z"}],
+            [{"user": {"login": "mallory"}, "submitted_at": "2026-01-02T00:00:00Z"}],
+        ]
+        with patch.object(poller, "run_json", side_effect=responses):
+            self.assertFalse(poller.notification_from_trusted_user(notification, {"danielbachhuber"}, gh="gh"))
 
     def test_fetch_notifications_parses_single_json_array(self):
         payload = [self.notification(id="1"), self.notification(id="2")]
